@@ -1,0 +1,259 @@
+{
+  "settings": {
+    "capital": 100000,
+    "maxLossPerDay": 5000,
+    "maxLossPerTrade": 2000,
+    "maxSectorExposurePct": 25,
+    "defaultCapitalPerTrade": 50000,
+    "slippagePct": 0.05,
+    "pollSeconds": 3
+  },
+  "strategies": [
+    {
+      "id": "esakky-bala-a-plus",
+      "name": "Esakky BALA A+ Strategy",
+      "enabled": true,
+      "type": "esakky",
+      "esakky": {
+        "strategy_name": "Esakky BALA A+ Strategy",
+        "version": "1.0",
+        "mode": "paper_only",
+        "live_orders_enabled": false,
+        "markets": [
+          "NIFTY",
+          "SENSEX"
+        ],
+        "timezone": "Asia/Kolkata",
+        "timeframes": {
+          "context": "15m",
+          "confirmation": "5m",
+          "execution": "1m"
+        },
+        "mandatory_rules": [
+          "Clear directional context or liquidity-sweep reversal",
+          "Valid 15m structure/ORB/key-level context",
+          "Completed 5m BOS/CHoCH with displacement",
+          "Completed 1m trigger after confirmation",
+          "Structural stop, realistic target, acceptable reward-to-risk, and risk filters pass"
+        ],
+        "confluence_score": {
+          "minimum_points": 7,
+          "total_points": 11,
+          "configurable": true,
+          "missing_data_counts_as_positive": false,
+          "factors": [
+            "Liquidity sweep",
+            "BOS/CHoCH alignment",
+            "Displacement",
+            "FVG retest",
+            "Order block or breaker",
+            "Volume/RVOL confirmation when valid",
+            "VWAP alignment",
+            "15m ORB alignment",
+            "FRVP context (POC touch alone is not an entry)",
+            "CPR/key-level context",
+            "Option-premium reaction zone (touch alone is not an entry)"
+          ]
+        },
+        "directional_setups": {
+          "bullish": [
+            "Bullish context or sell-side sweep and reclaim",
+            "5m bullish BOS/CHoCH and displacement on a completed candle",
+            "Prefer bullish FVG/OB/breaker retest and rejection",
+            "Completed 1m bullish trigger"
+          ],
+          "bearish": [
+            "Bearish context or buy-side sweep and rejection",
+            "5m bearish BOS/CHoCH and displacement on a completed candle",
+            "Prefer bearish FVG/OB/breaker retest and rejection",
+            "Completed 1m bearish trigger"
+          ]
+        },
+        "optional_filters": [
+          "VWAP",
+          "RVOL",
+          "simple volume",
+          "Keltner Channel",
+          "FRVP",
+          "CPR",
+          "option-premium reaction zones",
+          "footprint/DOM/delta only when verified feed exists"
+        ],
+        "risk": {
+          "max_risk_per_trade_percent": 1,
+          "max_trades_per_day": 2,
+          "minimum_reward_risk": 1.5,
+          "session_start_ist": "09:20",
+          "session_end_ist": "15:15",
+          "stop_method": "Structural invalidation with configurable volatility buffer",
+          "target_method": "Opposing liquidity/key level or configured R-multiple",
+          "daily_loss_limit": "configurable",
+          "square_off": true,
+          "no_stop_widening": true,
+          "no_averaging_down": true
+        },
+        "rvol_min": 1.2,
+        "atr_buffer_mult": 0.25,
+        "confirm_lookback": 8,
+        "signal_states": [
+          "A_PLUS_PAPER_LONG_CALL_BIAS",
+          "A_PLUS_PAPER_SHORT_PUT_BIAS",
+          "WATCH",
+          "NO_TRADE",
+          "DATA_UNAVAILABLE"
+        ],
+        "testing": {
+          "require_historical_backtest": true,
+          "include_fees_and_slippage": true,
+          "require_out_of_sample_validation": true,
+          "report": [
+            "win_rate",
+            "expectancy",
+            "profit_factor",
+            "max_drawdown",
+            "trade_count",
+            "session_breakdown"
+          ],
+          "do_not_claim_unverified_performance": true
+        },
+        "security": {
+          "credentials_in_source_code": false,
+          "credentials_in_logs": false,
+          "live_order_routes_disabled": true,
+          "duplicate_signal_prevention": true,
+          "idempotent_signal_ids": true
+        }
+      },
+      "instrument": {
+        "underlying": "NIFTY",
+        "exchange": "NSE",
+        "segment": "FNO",
+        "optionType": "CE",
+        "strikeOffset": 0,
+        "expiry": "weekly"
+      },
+      "entry": {
+        "window": {
+          "from": "09:20",
+          "to": "15:15"
+        },
+        "conditions": [],
+        "side": "BUY",
+        "quantity": 65,
+        "candleMinutes": 1
+      },
+      "exit": {
+        "stopLoss": null,
+        "target": null,
+        "timeExit": "15:15",
+        "conditions": []
+      },
+      "risk": {
+        "maxTradesPerDay": 2,
+        "capitalPerTrade": 50000
+      },
+      "sector": "Index"
+    },
+    {
+      "id": "nifty-orb-15m",
+      "name": "NIFTY ORB 15m",
+      "enabled": true,
+      "type": null,
+      "esakky": null,
+      "instrument": {
+        "underlying": "NIFTY",
+        "exchange": "NSE",
+        "segment": "FNO",
+        "optionType": "CE",
+        "strikeOffset": 0,
+        "expiry": "weekly"
+      },
+      "entry": {
+        "window": {
+          "from": "09:15",
+          "to": "14:30"
+        },
+        "conditions": [
+          {
+            "indicator": "ltp",
+            "op": "crossesAbove",
+            "value": "orbHigh"
+          }
+        ],
+        "side": "BUY",
+        "quantity": 65,
+        "candleMinutes": 1
+      },
+      "exit": {
+        "stopLoss": {
+          "type": "percent",
+          "value": 25
+        },
+        "target": {
+          "type": "percent",
+          "value": 50
+        },
+        "timeExit": "15:10",
+        "conditions": []
+      },
+      "risk": {
+        "maxTradesPerDay": 2,
+        "capitalPerTrade": 50000
+      },
+      "sector": "NIFTY"
+    },
+    {
+      "id": "nifty-trend-ema",
+      "name": "NIFTY TREND EMA 9/21",
+      "enabled": true,
+      "type": null,
+      "esakky": null,
+      "instrument": {
+        "underlying": "NIFTY",
+        "exchange": "NSE",
+        "segment": "FNO",
+        "optionType": "CE",
+        "strikeOffset": 0,
+        "expiry": "weekly"
+      },
+      "entry": {
+        "window": {
+          "from": "09:30",
+          "to": "15:00"
+        },
+        "conditions": [
+          {
+            "indicator": "ema9",
+            "op": "crossesAbove",
+            "value": "ema21"
+          },
+          {
+            "indicator": "rsi14",
+            "op": "<",
+            "value": 70
+          }
+        ],
+        "side": "BUY",
+        "quantity": 65,
+        "candleMinutes": 1
+      },
+      "exit": {
+        "stopLoss": {
+          "type": "percent",
+          "value": 30
+        },
+        "target": {
+          "type": "percent",
+          "value": 60
+        },
+        "timeExit": "15:15",
+        "conditions": []
+      },
+      "risk": {
+        "maxTradesPerDay": 2,
+        "capitalPerTrade": 50000
+      },
+      "sector": "NIFTY"
+    }
+  ]
+}

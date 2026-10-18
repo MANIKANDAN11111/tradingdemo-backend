@@ -1,0 +1,16 @@
+{
+  "NIFTY": "Index",
+  "BANKNIFTY": "Index",
+  "FINNIFTY": "Index",
+  "MIDCPNIFTY": "Index",
+  "SENSEX": "Index",
+  "RELIANCE": "Energy",
+  "TCS": "IT",
+  "INFY": "IT",
+  "HDFCBANK": "Banking",
+  "ICICIBANK": "Banking",
+  "SBIN": "Banking",
+  "TATAMOTORS": "Auto",
+  "MARUTI": "Auto",
+  "SUNPHARMA": "Pharma"
+}
