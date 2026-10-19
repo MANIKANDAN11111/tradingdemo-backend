@@ -5,6 +5,7 @@ import {
   listStrategies, upsertStrategy,
 } from '../bot/store.js';
 import { loadConfig, saveConfig, normaliseStrategy } from '../bot/strategy.js';
+import { tradeRow, positionRow } from '../bot/grid.js';
 
 const router = Router();
 
@@ -68,6 +69,28 @@ router.get('/trades', wrap(async (req, res) => {
     limit: Number(req.query.limit ?? 100),
   });
   res.json({ ok: true, trades: rows });
+}));
+
+/**
+ * Grid-ready trades — flat display rows for the broker dashboard's
+ * "Recent bot trades" table (Date / Day / Type / Symbol / Side / Entry /
+ * Exit / Qty / Capital / P&L / Est. charges / Net P&L / Reason).
+ */
+router.get('/trades/grid', wrap(async (req, res) => {
+  const rows = await listTrades({
+    mode: req.query.mode ?? undefined,
+    limit: Number(req.query.limit ?? 100),
+  });
+  res.json({ ok: true, trades: rows.map(tradeRow) });
+}));
+
+/** Grid-ready positions, open and closed. */
+router.get('/positions/grid', wrap(async (req, res) => {
+  const rows = await getAllPositions({
+    mode: req.query.mode ?? undefined,
+    limit: Number(req.query.limit ?? 100),
+  });
+  res.json({ ok: true, positions: rows.map(positionRow) });
 }));
 
 router.get('/positions', wrap(async (req, res) => {

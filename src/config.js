@@ -15,11 +15,25 @@ export const config = {
   totpSecret: process.env.GROWW_TOTP_SECRET || '',
   totpToken: process.env.GROWW_TOTP_KEY || '',
   apiVersion: process.env.GROWW_API_VERSION || '1.0',
+  /** Pre-existing Groww access token (JWT). If set, skips the token mint. */
+  accessToken: process.env.GROWW_ACCESS_TOKEN || '',
 
   // Fyers API credentials
   fyersAppId: process.env.FYERS_APP_ID || '',
   fyersAppSecret: process.env.FYERS_APP_SECRET || '',
   fyersRedirectUri: process.env.FYERS_REDIRECT_URI || 'https://trade.fyers.in/api-login/redirect-uri/index.html',
+
+  // Which broker executes live orders: 'auto' | 'fyers' | 'groww'.
+  // 'auto' picks whichever broker is verified against its own API right now.
+  liveBroker: (process.env.LIVE_BROKER || 'auto').toLowerCase(),
+
+  // Master switch for live order placement. MUST be true for any real order.
+  liveTradingEnabled: process.env.LIVE_TRADING_ENABLED === 'true',
+
+  // Where the OAuth callbacks send the browser back to. Must match the origin
+  // the user actually logs in on — localStorage (and therefore the session) is
+  // per-origin, so redirecting to the API port would drop them on a login page.
+  frontendUrl: (process.env.FRONTEND_URL || 'http://localhost:5173').replace(/\/$/, ''),
 
   // CoinSwitch PRO API
   coinSwitchSecret: process.env.COINSWITCH_SECRET || '',

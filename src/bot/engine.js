@@ -1,5 +1,6 @@
 import { deepCamel } from '../util/case.js';
 import { groww } from '../growwClient.js';
+import { fyers } from '../fyersClient.js';
 import { cached } from '../cache.js';
 import {
   getState, setState, listStrategies, listTrades, getOpenPositions,
@@ -24,24 +25,68 @@ import { evaluateEsakky, esakkyDecision } from './esakkyStrategy.js';
  * Nothing outside this module may write to bot_orders or bot_positions.
  */
 
-const TICK_MS = 2_000;      // poll upstream
+// Poll interval in seconds, read from strategies.json `settings.pollSeconds`.
+// Scheduled with a self-rescheduling timer rather than a fixed setInterval so
+// the value takes effect without restarting the bot.
+const DEFAULT_POLL_SECONDS = 300;
 const MAX_LOG = 200;
 
 const runtime = {
   timer: null,
   config: null,
-  symbols: new Map(),      // strategyId -> resolved instrument
+  symbols: new Map(),      // strategyId -> { inst, until, failedUntil, error }
   prevCtx: new Map(),      // strategyId -> previous context (for crosses)
   lastEval: new Map(),     // strategyId -> last confluence evaluation (for the UI)
   lastTick: null,
   ticks: 0,
+  sessionDate: null,       // IST date of the candles currently in memory
   log: [],
 };
 
+/**
+ * How long a resolved symbol is trusted. The weekly expiry rolls over and the
+ * ATM strike drifts as spot moves, so an unbounded cache serves a stale symbol.
+ */
+const SYMBOL_TTL_MS = 5 * 60_000;
+/**
+ * How long a FAILED resolution is remembered before it is retried. Caching a
+ * failure forever is what deadlocks a strategy for the whole session: it can
+ * never recover from one bad lookup that happened to land before market open.
+ */
+const SYMBOL_FAILURE_TTL_MS = 15_000;
+
+/** Consecutive all-strategies-failed ticks before the loop backs off. */
+const STALL_THRESHOLD = 10;
+const STALL_COOLDOWN_MS = 60_000;
+const stall = { consecutive: 0, cooldownUntil: 0 };
+
 /* ------------------------------------------------------------------ log --- */
 
+function sameDetail(a, b) {
+  return JSON.stringify(a) === JSON.stringify(b);
+}
+
+/**
+ * IST wall-clock 'HH:MM:SS'.
+ *
+ * Every strategy window in strategies.json is IST, and the engine compares IST
+ * minutes — so a UTC timestamp here is 5h30m off and reads as if the bot ran
+ * hours ago. The raw ISO `time` is kept for sorting and as React keys.
+ */
+function istClock(d = new Date()) {
+  return new Date(d.getTime() + 5.5 * 3600_000).toISOString().slice(11, 19);
+}
+
 function log(event, detail = null) {
-  const entry = { time: new Date().toISOString(), event, detail };
+  const entry = { time: new Date().toISOString(), timeIst: istClock(), event, detail };
+  const prev = runtime.log[0];
+  // An error repeated every 2s buries every other entry and makes the log
+  // useless, so identical consecutive entries are collapsed into one counter.
+  if (prev && prev.event === event && sameDetail(prev.detail, detail)) {
+    prev.count = (prev.count || 1) + 1;
+    prev.time = entry.time;
+    return prev;
+  }
   runtime.log.unshift(entry);
   if (runtime.log.length > MAX_LOG) runtime.log.pop();
   return entry;
@@ -57,26 +102,86 @@ async function reloadConfig() {
 
 /* --------------------------------------------------- instrument lookup --- */
 
-async function resolved(strategy, settings) {
-  const cachedSymbol = runtime.symbols.get(strategy.id);
-  if (cachedSymbol) return cachedSymbol;
-  const inst = await resolveInstrument(strategy.instrument);
-  runtime.symbols.set(strategy.id, inst);
-  return inst;
+/**
+ * Resolve (and cache) the instrument a strategy trades.
+ *
+ * Returns null instead of throwing: a strategy whose symbol cannot be resolved
+ * is SKIPPED for the tick, not fatal to the loop, and it retries after
+ * SYMBOL_FAILURE_TTL_MS rather than being cached dead for the session.
+ */
+async function resolved(strategy) {
+  const now = Date.now();
+  const entry = runtime.symbols.get(strategy.id);
+
+  if (entry?.inst && now < entry.until) return entry.inst;
+  if (!entry?.inst && entry?.failedUntil && now < entry.failedUntil) return null;
+
+  try {
+    const inst = await resolveInstrument(strategy.instrument);
+    runtime.symbols.set(strategy.id, {
+      inst, until: now + SYMBOL_TTL_MS, failedUntil: 0, error: null,
+    });
+    return inst;
+  } catch (e) {
+    runtime.symbols.set(strategy.id, {
+      inst: null, until: 0, failedUntil: now + SYMBOL_FAILURE_TTL_MS, error: e.message,
+    });
+    return null;
+  }
 }
 
+/**
+ * How long a quote is reused. Three strategies polling every 2s each used to
+ * fire their own upstream request — ~90/min against Fyers' Standard-plan
+ * allowance of 50 data requests/min — which tripped the 429 circuit breaker
+ * and risked a same-day account block. One call per symbol per few seconds
+ * collapses that to a fraction of the budget.
+ */
+const QUOTE_TTL_MS = 3_000;
+
 async function fetchQuote(inst) {
+  // Single-flight at the call site: strategies on the same underlying resolve
+  // to the same ATM symbol, so they share one upstream request.
+  const key = inst.quoteSymbol || `${inst.exchange}:${inst.segment}:${inst.symbol}`;
+  return cached(`bot:quote:${key}`, QUOTE_TTL_MS, () => fetchQuoteUncached(inst));
+}
+
+async function fetchQuoteUncached(inst) {
+  // Fyers-native symbol (NSE:NIFTY26O1923000CE) — only Fyers can quote it.
+  // Its quote payload nests the values under `v`, and the LTP key is `lp`.
+  if (inst.quoteSymbol) {
+    try {
+      const [q] = await fyers.quotes([inst.quoteSymbol]);
+      const v = q?.v ?? {};
+      const ltp = Number(v.lp ?? 0);
+      if (ltp) {
+        const prevClose = Number(v.prev_close_price ?? 0) || null;
+        return {
+          lastPrice: ltp,
+          volume: Number(v.volume ?? 0),
+          ohlc: {
+            open: Number(v.open_price ?? 0) || null,
+            high: Number(v.high_price ?? 0) || null,
+            low: Number(v.low_price ?? 0) || null,
+            close: prevClose,
+            prevClose,
+          },
+          source: 'fyers',
+        };
+      }
+    } catch { /* fall through to Groww */ }
+  }
+
+  // Groww-native symbol.
   try {
-    const raw = await cached(`bot:quote:${inst.exchange}:${inst.symbol}`, 2_000, () =>
-      groww.quote({ exchange: inst.exchange, segment: inst.segment, tradingSymbol: inst.symbol }),
-    );
-    return deepCamel(raw);
+    const raw = await groww.quote({ exchange: inst.exchange, segment: inst.segment, tradingSymbol: inst.symbol });
+    return { ...deepCamel(raw), source: 'groww' };
   } catch {
     const ltpKey = `${inst.exchange}_${inst.symbol}`;
     const map = await cached(`bot:ltp:${ltpKey}`, 2_000, () => groww.ltp([ltpKey], inst.segment));
     const v = map?.[ltpKey];
     const ltp = typeof v === 'number' ? v : v?.lastPrice ?? v?.ltp ?? null;
-    return ltp != null ? { lastPrice: ltp } : null;
+    return ltp != null ? { lastPrice: ltp, source: 'groww' } : null;
   }
 }
 
@@ -95,7 +200,7 @@ async function executeEntry({ strategy, inst, side, quantity, price, mode, setti
       segment: inst.segment, side, quantity, orderType: 'MARKET', status: 'PENDING',
       brokerOrderId: res.brokerOrderId, reason: `entry (${describeInstrument(inst)})`,
     });
-    await updateOrder(id, { status: 'FILLED', fillPrice: res.fillPrice, reason: `entry filled by Groww #${res.brokerOrderId}` });
+    await updateOrder(id, { status: 'FILLED', fillPrice: res.fillPrice, reason: `entry filled by Fyers #${res.brokerOrderId}` });
     await openPosition({
       strategyId: strategy.id, mode, symbol: inst.symbol, exchange: inst.exchange,
       segment: inst.segment, side, quantity, avgPrice: res.fillPrice,
@@ -133,7 +238,7 @@ async function executeExit({ strategy, position, exitPrice, reason, mode, settin
       orderType: 'MARKET', status: 'PENDING', brokerOrderId: res.brokerOrderId,
       reason: `exit ${reason} @ ${exitPrice}`,
     });
-    await updateOrder(id, { status: 'FILLED', fillPrice: res.fillPrice, reason: `exit filled by Groww #${res.brokerOrderId}` });
+    await updateOrder(id, { status: 'FILLED', fillPrice: res.fillPrice, reason: `exit filled by Fyers #${res.brokerOrderId}` });
     await paperClose(position, exitPrice, reason, 0);
     return { id, brokerOrderId: res.brokerOrderId };
   }
@@ -168,12 +273,15 @@ async function paperClose(position, exitPrice, reason, charges) {
 /* ---------------------------------------------------------------- tick --- */
 
 async function runStrategy(strategy, state, settings, mode) {
-  const inst = await resolved(strategy, settings);
-  if (!inst) return { skipped: 'unresolved symbol' };
+  const inst = await resolved(strategy);
+  if (!inst) {
+    const reason = runtime.symbols.get(strategy.id)?.error;
+    return { skipped: `unresolved symbol${reason ? `: ${reason}` : ''}`, noData: true };
+  }
 
   const q = await fetchQuote(inst);
   const ltp = Number(q?.lastPrice ?? inst.ltp ?? 0);
-  if (!ltp) return { skipped: 'no LTP', symbol: inst.symbol };
+  if (!ltp) return { skipped: 'no LTP', symbol: inst.symbol, noData: true };
 
   const candleMs = Number(strategy.entry.candleMinutes ?? 1) * 60_000;
   const candles = feed(
@@ -352,6 +460,14 @@ async function resolvedById(position) {
 async function tick() {
   const state = await getState();
   if (!state.running) return;
+
+  // Data feed is down: back off rather than hammering a broker that is
+  // refusing us, which on Fyers turns a limit into a same-day block.
+  if (Date.now() < stall.cooldownUntil) {
+    runtime.lastTick = new Date().toISOString();
+    return;
+  }
+
   runtime.lastTick = new Date().toISOString();
   runtime.ticks += 1;
 
@@ -362,17 +478,47 @@ async function tick() {
     await reloadConfig();
     idToStrategy = new Map();
 
+    // New IST trading day → drop the previous session's candles. Indicators,
+    // the ORB opening-range baseline and the cross detection all read from
+    // these bars, so carrying yesterday's (or a market-closed day's flat)
+    // candles into a new session would produce bogus signals.
+    const today = new Date(Date.now() + 5.5 * 3600_000).toISOString().slice(0, 10);
+    if (runtime.sessionDate && runtime.sessionDate !== today) {
+      resetAll();
+      runtime.prevCtx.clear();
+      log('session-reset', { from: runtime.sessionDate, to: today });
+    }
+    runtime.sessionDate = today;
+
     const { settings, strategies } = runtime.config || {};
     const enabled = (strategies || []).filter((s) => s.enabled);
+    const results = [];
     for (const strategy of enabled) {
       try {
         const result = await runStrategy(strategy, state, settings, state.mode);
+        results.push(result);
         if (result?.entered) log('entry', result.entered);
         else if (result?.closed) log('exit', result.closed);
       } catch (e) {
+        results.push({ error: e.message });
         log('error', `${strategy.id}: ${e.message}`);
       }
     }
+
+    // A tick where nothing could be priced means the feed is down. Back off
+    // after a few of those rather than retrying into a refusal.
+    const gotData = results.some((r) => r && !r.noData && !r.error);
+    stall.consecutive = gotData ? 0 : stall.consecutive + 1;
+    if (stall.consecutive >= STALL_THRESHOLD) {
+      stall.consecutive = 0;
+      stall.cooldownUntil = Date.now() + STALL_COOLDOWN_MS;
+      log('stall', {
+        reason: 'no strategy could be priced',
+        cooldownSeconds: STALL_COOLDOWN_MS / 1000,
+        blockers: (await brokerHealth()).blockers,
+      });
+    }
+
     const snap = await snapshotEquity(state, settings);
     log('tick', snap);
   } catch (e) {
@@ -382,6 +528,32 @@ async function tick() {
 
 /* ------------------------------------------------------------ controls --- */
 
+/**
+ * Self-scheduling tick loop.
+ *
+ * Reads `settings.pollSeconds` on every cycle instead of capturing a constant,
+ * so the interval can be changed in strategies.json without a restart. A chain
+ * of setTimeouts rather than setInterval, so a slow upstream call can never
+ * overlap the next tick.
+ */
+function scheduleNextTick(initialDelayMs = null) {
+  const secs = Number(runtime.config?.settings?.pollSeconds);
+  const ms = initialDelayMs != null
+    ? initialDelayMs
+    : (Number.isFinite(secs) && secs > 0 ? secs : DEFAULT_POLL_SECONDS) * 1000;
+  runtime.timer = setTimeout(async () => {
+    try {
+      await tick();
+    } catch (e) {
+      log('error', e.message);
+    } finally {
+      // stop() nulls runtime.timer; that null check is what ends the loop.
+      if (runtime.timer) scheduleNextTick();
+    }
+  }, ms);
+  unref(runtime.timer);
+}
+
 export async function start() {
   if (runtime.timer) return { ok: false, reason: 'already running' };
   await reloadConfig();
@@ -390,15 +562,60 @@ export async function start() {
   runtime.lastEval.clear();
   idToStrategy = new Map();
   resetAll();
+  stall.consecutive = 0;
+  stall.cooldownUntil = 0;
+
+  // Backfill historical 1m candles for each enabled strategy so signal
+  // evaluation has enough data on the first tick. Without this, a 5-minute
+  // poll interval means strategies wait hours before accumulating enough
+  // candles to generate any signal at all.
+  await backfillCandles();
+
   const state = await setState({ running: true, startedAt: new Date().toISOString(), haltedReason: null });
-  runtime.timer = setInterval(tick, TICK_MS);
-  unref(runtime.timer);
-  log('start', { mode: state.mode });
+  scheduleNextTick(0);   // first tick immediately, then every pollSeconds
+  // Report data availability up front: a bot that is "running" with no feed is
+  // indistinguishable from a working one unless we say so.
+  const brokers = await brokerHealth();
+  log('start', { mode: state.mode, hasDataSource: brokers.hasDataSource, blockers: brokers.blockers });
   return { ok: true, state };
 }
 
+/**
+ * Fetch recent 1m OHLC candles from Groww for each strategy's resolved symbol
+ * and feed them into the candle store. This gives indicators enough history
+ * to produce meaningful values on the very first tick.
+ */
+async function backfillCandles() {
+  const { strategies } = runtime.config || {};
+  const enabled = (strategies || []).filter((s) => s.enabled);
+
+  for (const strategy of enabled) {
+    try {
+      const inst = await resolveInstrument(strategy.instrument);
+      const candleMs = Number(strategy.entry.candleMinutes ?? 1) * 60_000;
+      const key = `${strategy.id}:${inst.symbol}`;
+
+      // Groww OHLC returns recent intraday candles. We use the underlying
+      // (spot) symbol — Groww's live-data/ohlc works with NSE_NIFTY style keys.
+      const ltpKey = `${inst.exchange}_${inst.symbol}`;
+      const raw = await groww.ohlc([ltpKey], inst.segment).catch(() => null);
+      const rows = raw?.[ltpKey] ?? raw ?? [];
+      if (!Array.isArray(rows) || rows.length === 0) continue;
+
+      // Feed oldest→newest so the candle store ends with the most recent bar.
+      for (const row of rows.slice(-50)) {
+        const time = row.time ? new Date(row.time).getTime() : Date.now();
+        feed(key, { price: row.close ?? row.ltp ?? 0, volume: row.volume ?? 0, time }, candleMs);
+      }
+      log('backfill', { symbol: inst.symbol, strategy: strategy.id, candles: Math.min(rows.length, 50) });
+    } catch (e) {
+      log('backfill-error', { strategy: strategy.id, error: e.message });
+    }
+  }
+}
+
 export async function stop() {
-  if (runtime.timer) clearInterval(runtime.timer);
+  if (runtime.timer) clearTimeout(runtime.timer);
   runtime.timer = null;
   const state = await setState({ running: false, armed: false });
   log('stop', null);
@@ -422,7 +639,7 @@ export async function halt(reason = 'manual halt') {
     }
   }
   await setState({ running: false, armed: false, haltedReason: reason });
-  if (runtime.timer) clearInterval(runtime.timer);
+  if (runtime.timer) clearTimeout(runtime.timer);
   runtime.timer = null;
   log('halt', reason);
   return { ok: true, reason };
@@ -440,7 +657,6 @@ export async function arm() {
     return { ok: false, reason: liveBrokerStatus().reasons.join('; ') };
   }
   const state = await getState();
-  if (state.mode !== 'live') return { ok: false, reason: 'Switch to LIVE before arming.' };
   const s = await setState({ armed: true });
   log('armed', null);
   return { ok: true, state: s };
@@ -457,20 +673,49 @@ export async function status() {
   // Read from disk so the UI reflects the file rather than a stale snapshot.
   const { settings, strategies } = await reloadConfig();
   const exposure = await sectorExposureSafe(state.mode, state.capital);
+  const brokers = await brokerHealth();
   return {
     ...state,
     live: liveBrokerStatus(),
+    brokers,
     settings,
     strategies: strategies.map((s) => ({
       ...s,
-      symbol: runtime.symbols.get(s.id)?.symbol || null,
-      resolved: runtime.symbols.get(s.id)?.resolved || null,
+      symbol: runtime.symbols.get(s.id)?.inst?.symbol || null,
+      resolved: runtime.symbols.get(s.id)?.inst?.resolved || null,
+      resolveError: runtime.symbols.get(s.id)?.error || null,
       lastEval: runtime.lastEval.get(s.id) || null,
     })),
     exposure,
     ticks: runtime.ticks,
     lastTick: runtime.lastTick,
+    stalled: Date.now() < stall.cooldownUntil,
+    stallCooldownUntil: stall.cooldownUntil ? new Date(stall.cooldownUntil).toISOString() : null,
     equity: await latestEquity(state.mode),
+  };
+}
+
+/**
+ * Why the bot has no data, in one place.
+ *
+ * The engine and the UI both read this so "the bot is doing nothing" becomes a
+ * specific, actionable line of text instead of an empty log and a flat equity
+ * curve.
+ */
+async function brokerHealth() {
+  const [{ growwHealth, growwHoldbackStatus }, { fyersHealth }] = await Promise.all([
+    import('../growwClient.js'),
+    import('../fyersClient.js'),
+  ]);
+  const groww = growwHealth();
+  const fyers = fyersHealth();
+  return {
+    groww,
+    fyers,
+    growwHoldback: growwHoldbackStatus(),
+    // Nothing can trade without at least one live chain source.
+    hasDataSource: Boolean(groww.ok || fyers.ok),
+    blockers: [...groww.problems, ...fyers.problems],
   };
 }
 
@@ -499,4 +744,4 @@ function unref(timer) {
   if (timer && typeof timer.unref === 'function') timer.unref();
 }
 
-export const engine = { start, stop, halt, setMode, arm, disarm, status, recentLog };
+export const engine = { start, stop, halt, setMode, arm, disarm, status, recentLog, fetchQuote };

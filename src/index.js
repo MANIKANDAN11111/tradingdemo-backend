@@ -135,11 +135,14 @@ app.listen(config.port, () => {
       console.log('[db] bot tables ready');
       try {
         const st = await engineStatus();
-        if (st?.running) {
-          const res = await startEngine();
-          console.log(`[bot] engine resumed: ${res?.ok ? 'ticking' : res?.reason}`);
+        // Auto-start on boot unless the bot was explicitly halted for the day.
+        // This used to be two competing blocks, the second of which started the
+        // engine unconditionally — so "stop" silently did not survive a restart.
+        if (st?.haltedReason) {
+          console.log(`[bot] engine not auto-started — halted: ${st.haltedReason}`);
         } else {
-          console.log('[bot] engine idle');
+          const res = await startEngine();
+          console.log(`[bot] engine auto-started: ${res?.ok ? 'ticking' : res?.reason}`);
         }
       } catch (e) {
         console.error(`[bot] engine resume failed: ${e.message}`);
@@ -201,21 +204,4 @@ app.listen(config.port, () => {
     setInterval(tick, FYERS_REFRESH_INTERVAL);
     console.log('[fyers] auto-refresh loop armed');
   }).catch((e) => console.warn(`[fyers] auto-refresh setup failed: ${e.message}`));
-
-  // Auto-start the bot on boot if it was running before a restart.
-  import('./bot/engine.js').then(async (engine) => {
-    try {
-      const st = await engine.status();
-      if (st?.running) {
-        const res = await engine.start();
-        console.log(`[bot] auto-started: ${res?.ok ? 'ticking' : res?.reason}`);
-      } else {
-        // Start the bot by default on first boot.
-        const res = await engine.start();
-        console.log(`[bot] auto-started on boot: ${res?.ok ? 'ticking' : res?.reason}`);
-      }
-    } catch (e) {
-      console.warn(`[bot] auto-start failed: ${e.message}`);
-    }
-  });
 });
